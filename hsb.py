@@ -16,17 +16,21 @@ ADDR = 0x55                  # 7-bit address: ADR0-2 all H = 0x55, all NC = 0x4A
 RSENSE = 0.0003              # ohm, effective (stock DC2024A: 10 x 3 mOhm)
 INTERNAL_THRESHOLDS = False  # True once R1, R2, R3, R7, R8 are removed (required for 5 V)
 ALERT_TO_ON = False          # True once E12 ALERT is wired to E7 ON (JP2 = FLOAT)
-PGOOD = [1, 2, 3]            # GPIOs wired to LTM4707 PGOODs (GPIO1 = E3, GPIO2 = E13, GPIO3 = E14); [] = off
+PGOOD = [1, 2]               # GPIOs wired to LTM4707 PGOODs (GPIO1 = E3, GPIO2 = E13, GPIO3 = E14); [] = off
+VOUT_GPIO = 3                # GPIO reading LTM4707 Vout through a divider (2 = E13, 3 = E14; remove R4 / R6); None = off
+VOUT_RATIO = 4.0             # divider ratio: (3k + 1k) / 1k. Calibrate: ratio * (meter Vout / displayed Vout)
 PGOOD_TIMEOUT = 2.0          # s to watch the PGOODs after release
 ILIM_CODE = 0                # current limit 12.5 mV + 3.125 mV * code (code 0 = 41.7 A on the stock board)
 LIMITS = {  # sw_*: checked here every conversion; hw_*: chip alarm registers (ALERT)
     12: dict(sw_iin=12.0, sw_pin=140.0, sw_vin_min=11.0, sw_vin_max=13.0, hw_iin=15.0, hw_pin=160.0, hw_vin=13.2),
     5: dict(sw_iin=28.0, sw_pin=140.0, sw_vin_min=4.6, sw_vin_max=5.4, hw_iin=30.0, hw_pin=160.0, hw_vin=5.5)}
+VOUT_MIN, VOUT_MAX = None, None  # optional Vout trip limits in volts (min is checked 1 s after release)
 # ----------------------------------------------------------
 say, STOP, on_sample = print, threading.Event(), None       # GUI hooks: output, stop flag, sample callback (hsb_gui.py)
 VFS, MODE = {5: 8.32, 12: 16.64}, {5: 1, 12: 2}           # ADC full scale and VIN_MODE code
 FAULTS = {0x40: "FET-bad", 0x20: "FET short", 0x08: "power bad", 0x04: "overcurrent", 0x02: "undervoltage", 0x01: "overvoltage"}
 ALARMS = {0x80: "power alarm", 0x20: "current alarm", 0x08: "voltage alarm"}
+PGOOD = [n for n in PGOOD if n != VOUT_GPIO]               # a pin cannot be both
 SIG = [("FET on", 1, 0x80), ("gates >8V", 0, -0x02), ("hot-swap PG", 1, 0x08)] + \
       [(f"PGOOD{n}", 2, {1: 0x20, 2: 0x40, 3: 0x80}[n]) for n in PGOOD]   # name, byte in 0x1D-0x1F, mask (<0 = active low)
 
@@ -69,6 +73,7 @@ def sample(b, vin):
     k = 0.04 / 65535 / RSENSE                                       # amps per VSENSE code
     return dict(t=now(), vin=u16(a, 6) * vfs / 65535, iin=u16(a, 12) * k, pin=u16(a, 18) * k * vfs * 65536 / 65535,
                 wh=int.from_bytes(r[0x12:0x18], "big") * k * vfs * 0.065535 * 256 / 65535 / 3600,
+                vout=u16(a, 0) * 1.28 / 65535 * VOUT_RATIO if VOUT_GPIO else None,      # VGPIO 0x34
                 n=int.from_bytes(r[0x18:0x1C], "big"), fault=r[4], adc=r[5] & r[3], alert=r[0x1C] & 0xC0,
                 st0=r[0x1E], st1=r[0x1F], on=bool(r[0x1E] & 0x80), pg=bool(r[0x1E] & 8), uv=r[0x1E] & 2, ov=r[0x1E] & 1)
 
@@ -82,7 +87,7 @@ def image(vin):
             0x0B: max(1, min(255, int(L["hw_vin"] / vfs * 255))),
             0x0D: max(1, min(255, int(L["hw_iin"] * RSENSE * 255 / 0.04))),
             0x0F: max(1, min(255, int(L["hw_pin"] * RSENSE * 65025 / (0.04 * vfs * 256)))),
-            0x11: ILIM_CODE << 5 | m << 3 | 0x06}                   # foldback = VIN mode, ADC: SOURCE + GPIO2, 12-bit
+            0x11: ILIM_CODE << 5 | m << 3 | 0x04 | (0 if VOUT_GPIO == 3 else 0x02)}  # foldback = VIN mode, ADC: SOURCE + GPIO2/3, 12-bit
 
 
 def off(b):
@@ -108,6 +113,8 @@ def check(s, vin, ctx):
     if pin > L["sw_pin"]: causes.append(f"Pin {pin:.2f} W > {L['sw_pin']} W")
     if s["vin"] > L["sw_vin_max"]: causes.append(f"Vin {s['vin']:.3f} V > {L['sw_vin_max']} V")
     if now() - ctx["t_on"] > 1.0 and s["vin"] < L["sw_vin_min"]: causes.append(f"Vin {s['vin']:.3f} V < {L['sw_vin_min']} V")
+    if VOUT_GPIO and VOUT_MAX is not None and s["vout"] > VOUT_MAX: causes.append(f"Vout {s['vout']:.3f} V > {VOUT_MAX} V")
+    if VOUT_GPIO and VOUT_MIN is not None and now() - ctx["t_on"] > 1.0 and s["vout"] < VOUT_MIN: causes.append(f"Vout {s['vout']:.3f} V < {VOUT_MIN} V")
     return causes
 
 
@@ -158,10 +165,11 @@ def run(b, vin, seconds):
     else: sys.exit("the ADC is not converting")
     ctx = dict(zero=sum(zs) / 3, t_on=now())
     name = datetime.now().strftime("hsb_%Y%m%d_%H%M%S.csv"); f = open(name, "w", newline=""); w = csv.writer(f)
-    w.writerow(["time", "kind", "vin_V", "iin_A", "pin_W", "energy_Wh", "status", "fault_log", "note"])
+    w.writerow(["time", "kind", "vin_V", "iin_A", "pin_W", "energy_Wh", "vout_V", "status", "fault_log", "note"])
     def log(kind, s=None, note="", t=None):
         w.writerow([iso(t or now()), kind] + ([f"{s['vin']:.4f}", f"{s['iin'] - ctx['zero']:.4f}", f"{s['pin']:.3f}",
-                   f"{s['wh']:.6f}", f"0x{s['st0']:02X}{s['st1']:02X}", f"0x{s['fault']:02X}"] if s else [""] * 6) + [note]); f.flush()
+                   f"{s['wh']:.6f}", "" if s["vout"] is None else f"{s['vout']:.4f}", f"0x{s['st0']:02X}{s['st1']:02X}",
+                   f"0x{s['fault']:02X}"] if s else [""] * 7) + [note]); f.flush()
     log("start", note=f"{vin} V profile, supply {vdd:.3f} V, zero {ctx['zero'] * 1000:.1f} mA")
     say(f"supply {vdd:.3f} V, zero offset {ctx['zero'] * 1000:.1f} mA, logging to {name}")
     b.write(0x1D, 0x40); b.write(0x1D, 0); b.write(0x04, 0, 0); b.write(0x1C, 0); b.write(0x02, 0x6F, 0xA8)  # arm alerts
@@ -181,11 +189,12 @@ def run(b, vin, seconds):
                 continue
             if s["n"] == last: continue
             last = s["n"]; log("sample", s)
-            if on_sample: on_sample(s["t"], s["vin"], s["iin"] - ctx["zero"], s["pin"] - ctx["zero"] * s["vin"])
+            if on_sample and s["pg"]: on_sample(s["t"], s["vin"], s["iin"] - ctx["zero"], s["pin"] - ctx["zero"] * s["vin"], s["vout"] or 0.0)
             if c := check(s, vin, ctx): trip(b, c, log); return 2
             pg = "".join("1" if s["st1"] & SIG[i][2] else "0" for i in range(3, len(SIG)))
             say(f"\r{iso(s['t'])[11:23]}  ON  Vin {s['vin']:7.3f} V  Iin {s['iin'] - ctx['zero']:7.3f} A  "
-                  f"Pin {s['pin'] - ctx['zero'] * s['vin']:7.2f} W  {s['wh']:9.5f} Wh  {'PG' if s['pg'] else '--'}  PGOOD {pg or '-'} ", end="")
+                  f"Pin {s['pin'] - ctx['zero'] * s['vin']:7.2f} W  " + (f"Vout {s['vout']:6.3f} V  " if VOUT_GPIO else "") +
+                  f"{s['wh']:9.5f} Wh  {'PG' if s['pg'] else '--'}  PGOOD {pg or '-'} ", end="")
         say()
     except KeyboardInterrupt:
         say()
@@ -208,7 +217,7 @@ def flash(b, vin):
 def status(b, vin):
     s = sample(b, vin)
     say(f"{iso(s['t'])}  output {'ON' if s['on'] else 'OFF'}  Vout(source) {s['vin']:.3f} V  Iin {s['iin']:.3f} A  "
-          f"Pin {s['pin']:.2f} W  energy {s['wh']:.5f} Wh\n  PG {s['pg']}  UV {bool(s['uv'])}  OV {bool(s['ov'])}  "
+          f"Pin {s['pin']:.2f} W  " + (f"Vout {s['vout']:.3f} V  " if VOUT_GPIO else "") + f"energy {s['wh']:.5f} Wh\n  PG {s['pg']}  UV {bool(s['uv'])}  OV {bool(s['ov'])}  "
           f"alert latched {bool(s['alert'])}  GPIO1-3 {s['st1'] >> 5 & 1}{s['st1'] >> 6 & 1}{s['st1'] >> 7 & 1}  "
           f"faults {names(s['fault'], FAULTS) or 'none'}  alarms {names(s['adc'], ALARMS) or 'none'}")
 

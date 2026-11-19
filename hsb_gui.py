@@ -12,7 +12,8 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
-SERIES, WINDOW = (("Vin", "V", "40d060", 0.2), ("Iin", "A", "50a0ff", 0.5), ("Pin", "W", "ffa040", 5.0)), 60.0  # name, unit, color, min span; s
+SERIES = (("Vin", "V", "40d060", 0.2), ("Iin", "A", "50a0ff", 0.5), ("Pin", "W", "ffa040", 5.0), ("Vout", "V", "c080ff", 0.05))
+SERIES, WINDOW = SERIES[:4 if hsb.VOUT_GPIO else 3], 60.0  # name, unit, color, min span; seconds shown
 
 
 class Chart(Widget):  # rolling strip chart, one autoscaled band per trace
